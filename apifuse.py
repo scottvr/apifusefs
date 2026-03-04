@@ -56,6 +56,17 @@ class JSONCacheEntry:
     error: APISpecError | None = None
 
 
+@dataclass(frozen=True)
+class SymlinkNode:
+    target: str
+
+
+@dataclass
+class AliasCacheEntry:
+    expires_at: float
+    aliases: dict[str, str]
+
+
 class APISpecError(RuntimeError):
     def __init__(self, message: str, status_code: int | None = None) -> None:
         super().__init__(message)
@@ -74,6 +85,8 @@ class APIFuse(fuse.Operations):
     - Dicts and arrays become directories.
     """
 
+    use_ns = True
+
     def __init__(
         self,
         api_spec: str,
@@ -86,6 +99,8 @@ class APIFuse(fuse.Operations):
         cache_ttl: float = 2.0,
         error_cache_ttl: float = 1.0,
         cache_max_entries: int = 512,
+        symlink_names: bool = False,
+        symlink_map: list[str] | None = None,
     ) -> None:
         self.timeout = timeout
         self.spec_source = api_spec
@@ -99,14 +114,22 @@ class APIFuse(fuse.Operations):
         self.cache_ttl = max(0.0, cache_ttl)
         self.error_cache_ttl = max(0.0, error_cache_ttl)
         self.cache_max_entries = max(1, cache_max_entries)
+        self.symlink_names = symlink_names
         self._json_cache: dict[str, JSONCacheEntry] = {}
+        self._alias_cache: dict[str, AliasCacheEntry] = {}
         self._ssl_context = ssl.create_default_context()
         self.spec = self._load_spec(api_spec)
         self._components = self._extract_components(self.spec)
         self.base_url = self._determine_base_url(api_spec, self.spec, self.server_url_override)
         self.endpoints = self._discover_endpoints(self.spec)
+        self._symlink_field_map = self._build_symlink_field_map(symlink_names, symlink_map or [])
+        if self._symlink_field_map:
+            LOGGER.debug("symlink aliases enabled: %s", self._symlink_field_map)
+        else:
+            LOGGER.debug("symlink aliases disabled")
         self._dir_mode = stat.S_IFDIR | 0o755
         self._file_mode = stat.S_IFREG | 0o444
+        self._symlink_mode = stat.S_IFLNK | 0o777
 
     def access(self, path: str, mode: int) -> int:
         try:
@@ -126,6 +149,9 @@ class APIFuse(fuse.Operations):
             normalized = self._normalize_path(path)
             if normalized == "/":
                 return self._stat_for_dir(now)
+            symlink = self._get_symlink_node(normalized)
+            if symlink is not None:
+                return self._stat_for_symlink(now, len(symlink.target.encode("utf-8")))
             if self._is_directory(normalized):
                 return self._stat_for_dir(now)
             node = self._get_file_node(normalized)
@@ -161,6 +187,18 @@ class APIFuse(fuse.Operations):
             raise
         except Exception as exc:
             LOGGER.exception("read failed for %s", path)
+            raise self._unexpected_fuse_error(exc) from exc
+
+    def readlink(self, path: str) -> str:
+        try:
+            symlink = self._get_symlink_node(self._normalize_path(path))
+            if symlink is None:
+                raise fuse.FuseOSError(errno.ENOENT)
+            return symlink.target
+        except fuse.FuseOSError:
+            raise
+        except Exception as exc:
+            LOGGER.exception("readlink failed for %s", path)
             raise self._unexpected_fuse_error(exc) from exc
 
     def readdir(self, path: str, fh: int) -> list[str]:
@@ -215,6 +253,16 @@ class APIFuse(fuse.Operations):
     def _stat_for_file(self, now: float, size: int) -> dict[str, Any]:
         return {
             "st_mode": self._file_mode,
+            "st_nlink": 1,
+            "st_size": size,
+            "st_ctime": now,
+            "st_mtime": now,
+            "st_atime": now,
+        }
+
+    def _stat_for_symlink(self, now: float, size: int) -> dict[str, Any]:
+        return {
+            "st_mode": self._symlink_mode,
             "st_nlink": 1,
             "st_size": size,
             "st_ctime": now,
@@ -278,6 +326,15 @@ class APIFuse(fuse.Operations):
             return None
         assert isinstance(value, bytes)
         return FileNode(content=value)
+
+    def _get_symlink_node(self, path: str) -> SymlinkNode | None:
+        path_type, endpoint, remainder = self._classify_path(path)
+        if path_type != "resource_dir" or endpoint is None or len(remainder) != 1:
+            return None
+        alias_target = self._collection_alias_map(endpoint).get(remainder[0])
+        if alias_target is None:
+            return None
+        return SymlinkNode(target=alias_target)
 
     def _endpoint_meta_file(self, endpoint: EndpointDefinition) -> FileNode:
         body = json.dumps(
@@ -346,7 +403,9 @@ class APIFuse(fuse.Operations):
                 if error_message is None:
                     error_message = str(exc)
 
-        entries.extend(sorted(set(ids), key=self._sort_key))
+        unique_ids = sorted(set(ids), key=self._sort_key)
+        entries.extend(unique_ids)
+        entries.extend(self._collection_alias_entries(endpoint, unique_ids))
         if error_message and not ids:
             entries.append(".error.txt")
         return entries
@@ -630,6 +689,103 @@ class APIFuse(fuse.Operations):
                         return identifier
         return str(index)
 
+    def _collection_alias_entries(
+        self,
+        endpoint: EndpointDefinition,
+        ids: list[str],
+    ) -> list[str]:
+        if not ids:
+            return []
+        return sorted(self._collection_alias_map(endpoint, ids).keys(), key=self._sort_key)
+
+    def _collection_alias_map(
+        self,
+        endpoint: EndpointDefinition,
+        resource_ids: list[str] | None = None,
+    ) -> dict[str, str]:
+        field_paths = self._symlink_field_map.get(endpoint.name, [])
+        if not field_paths:
+            return {}
+
+        cached_aliases = self._get_cached_aliases(endpoint.name)
+        if cached_aliases is not None:
+            return cached_aliases
+
+        if resource_ids is None:
+            try:
+                resource_ids = self._fetch_collection_ids(endpoint)
+            except APISpecError as exc:
+                LOGGER.debug(
+                    "alias build for /%s could not use collection listing: %s; falling back to probing",
+                    endpoint.name,
+                    exc,
+                )
+                resource_ids = self._probe_resource_ids(endpoint)
+
+        alias_map: dict[str, str] = {}
+        reserved = set(resource_ids)
+        reserved.update({".meta.json", ".error.txt"})
+
+        for resource_id in sorted(set(resource_ids), key=self._sort_key):
+            try:
+                response = self._fetch_resource_response(endpoint, resource_id)
+            except APISpecError as exc:
+                LOGGER.debug(
+                    "skipping alias generation for /%s/%s: %s",
+                    endpoint.name,
+                    resource_id,
+                    exc,
+                )
+                continue
+            resource_root = self._extract_resource_root(response)
+            for field_path in field_paths:
+                alias = self._alias_from_field_path(resource_root, field_path)
+                if alias is None or alias in reserved or alias in alias_map:
+                    continue
+                alias_map[alias] = resource_id
+
+        self._cache_aliases(endpoint.name, alias_map)
+        LOGGER.debug(
+            "built %d symlink aliases for /%s from fields %s",
+            len(alias_map),
+            endpoint.name,
+            ["/".join(path) for path in field_paths],
+        )
+        return alias_map
+
+    def _alias_from_field_path(self, node: Any, field_path: tuple[str, ...]) -> str | None:
+        value = self._extract_value_at_parts(node, list(field_path))
+        if value is None:
+            return None
+        if isinstance(value, (dict, list)):
+            return None
+        alias = self._sanitize_path_component(str(value))
+        return alias or None
+
+    def _extract_value_at_parts(self, node: Any, parts: list[str]) -> Any | None:
+        current = node
+        for part in parts:
+            if isinstance(current, dict):
+                if part not in current:
+                    return None
+                current = current[part]
+                continue
+            if isinstance(current, list):
+                if part.isdigit():
+                    index = int(part)
+                    if index < 0 or index >= len(current):
+                        return None
+                    current = current[index]
+                    continue
+                if len(current) == 1:
+                    current = current[0]
+                    if isinstance(current, dict) and part in current:
+                        current = current[part]
+                        continue
+                return None
+            return None
+        return current
+
     def _encode_scalar(self, value: Any) -> bytes:
         if isinstance(value, bool):
             return ("true\n" if value else "false\n").encode("utf-8")
@@ -692,6 +848,60 @@ class APIFuse(fuse.Operations):
             if value:
                 return value
         return None
+
+    def _build_symlink_field_map(
+        self,
+        symlink_names: bool,
+        symlink_map_args: list[str],
+    ) -> dict[str, list[tuple[str, ...]]]:
+        alias_map: dict[str, list[tuple[str, ...]]] = {}
+        if symlink_names:
+            default_paths = (
+                ("name",),
+                ("username",),
+                ("slug",),
+                ("title",),
+            )
+            for endpoint_name in self.endpoints:
+                alias_map.setdefault(endpoint_name, []).extend(default_paths)
+
+        for raw_arg in symlink_map_args:
+            for entry in raw_arg.split(","):
+                entry = entry.strip()
+                if not entry:
+                    continue
+                parsed = self._parse_symlink_map_entry(entry)
+                if parsed is None:
+                    LOGGER.warning("ignoring invalid --symlink-map entry: %s", entry)
+                    continue
+                endpoint_name, field_path = parsed
+                if endpoint_name not in self.endpoints:
+                    LOGGER.warning(
+                        "ignoring --symlink-map entry for unknown collection %s",
+                        endpoint_name,
+                    )
+                    continue
+                bucket = alias_map.setdefault(endpoint_name, [])
+                if field_path not in bucket:
+                    bucket.append(field_path)
+
+        return alias_map
+
+    def _parse_symlink_map_entry(self, entry: str) -> tuple[str, tuple[str, ...]] | None:
+        if "=" not in entry:
+            return None
+        endpoint_name, mapping = entry.split("=", 1)
+        endpoint_name = endpoint_name.strip().strip("/")
+        mapping = mapping.strip()
+        if not endpoint_name or not mapping:
+            return None
+        if ":" in mapping:
+            return None
+
+        parts = tuple(part for part in mapping.strip("/").split("/") if part)
+        if not parts:
+            return None
+        return endpoint_name, parts
 
     def _load_spec(self, source: str) -> dict[str, Any]:
         candidates = [source]
@@ -1137,6 +1347,31 @@ class APIFuse(fuse.Operations):
             oldest_key = next(iter(self._json_cache))
             self._json_cache.pop(oldest_key, None)
 
+    def _get_cached_aliases(self, endpoint_name: str) -> dict[str, str] | None:
+        entry = self._alias_cache.get(endpoint_name)
+        if entry is None:
+            return None
+        now = time.time()
+        if entry.expires_at <= now:
+            self._alias_cache.pop(endpoint_name, None)
+            return None
+        self._alias_cache.pop(endpoint_name, None)
+        self._alias_cache[endpoint_name] = entry
+        return dict(entry.aliases)
+
+    def _cache_aliases(self, endpoint_name: str, aliases: dict[str, str]) -> None:
+        if self.cache_ttl <= 0:
+            self._alias_cache.pop(endpoint_name, None)
+            return
+        self._alias_cache.pop(endpoint_name, None)
+        self._alias_cache[endpoint_name] = AliasCacheEntry(
+            expires_at=time.time() + self.cache_ttl,
+            aliases=dict(aliases),
+        )
+        while len(self._alias_cache) > self.cache_max_entries:
+            oldest_key = next(iter(self._alias_cache))
+            self._alias_cache.pop(oldest_key, None)
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -1190,6 +1425,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum number of cached JSON responses (default: 512)",
     )
     parser.add_argument(
+        "--symlink-names",
+        action="store_true",
+        help="add collection-level symlink aliases using common name fields like name, username, slug, or title",
+    )
+    parser.add_argument(
+        "--symlink-map",
+        action="append",
+        default=[],
+        help="add custom collection symlink aliases, e.g. products=title or products=categories/name",
+    )
+    parser.add_argument(
         "--timeout",
         type=float,
         default=10.0,
@@ -1229,6 +1475,8 @@ def main(argv: list[str] | None = None) -> int:
             cache_ttl=args.cache_ttl,
             error_cache_ttl=args.error_cache_ttl,
             cache_max_entries=args.cache_max_entries,
+            symlink_names=args.symlink_names,
+            symlink_map=args.symlink_map,
         )
     except APISpecError as exc:
         parser.error(str(exc))
