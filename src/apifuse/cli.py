@@ -210,6 +210,22 @@ def main(argv: list[str] | None = None) -> int:
         args.server_url,
         args.foreground,
     )
+    if mode == "openapi":
+        has_refresh_token_source = bool(
+            args.refresh_token
+            or args.refresh_token_file
+            or (args.refresh_token_env and os.environ.get(args.refresh_token_env))
+        )
+        discovery_scope = args.refresh_discovery_path or ["<auth-like default>"]
+        LOGGER.debug(
+            "refresh config: discover=%s scope=%s url_keys=%s token_keys=%s explicit_refresh_url=%s explicit_refresh_token=%s",
+            args.discover_refresh_from_response,
+            discovery_scope,
+            args.refresh_discovery_url_key or ["refresh_url", "refresh_endpoint", "token_refresh_url"],
+            args.refresh_discovery_token_key or ["refresh_token"],
+            bool(args.refresh_url),
+            has_refresh_token_source,
+        )
     if args.log_file:
         LOGGER.info("logging to %s", args.log_file)
     if args.daemonize and sys.platform == "darwin":

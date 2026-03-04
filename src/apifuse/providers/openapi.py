@@ -189,6 +189,16 @@ class APIFuse(fuse.Operations):
             )
             if key and key.strip()
         )
+        if self.discover_refresh_from_response:
+            scope = self.refresh_discovery_paths or ("<auth-like default>",)
+            LOGGER.debug(
+                "refresh discovery enabled: scope=%s url_keys=%s token_keys=%s",
+                list(scope),
+                list(self.refresh_discovery_url_keys),
+                list(self.refresh_discovery_token_keys),
+            )
+        else:
+            LOGGER.debug("refresh discovery disabled")
         self._last_auth_error: str | None = None
         self._auth = self._build_auth_provider(
             header_name=auth_header,
