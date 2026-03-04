@@ -18,7 +18,7 @@ from typing import Any
 
 import mfusepy as fuse
 
-from apifuse.auth import NoAuth, RefreshingTokenAuth, StaticTokenAuth
+from apifuse.auth import NoAuth, RefreshingTokenAuth
 from apifuse.fuse_ops import ProviderError, ProviderNode
 
 try:
@@ -140,6 +140,10 @@ class APIFuse(fuse.Operations):
         refresh_token_env: str | None = "APIFUSE_refresh_token",
         refresh_body_token_key: str = "refresh_token",
         refresh_response_token_key: str = "access_token",
+        discover_refresh_from_response: bool = False,
+        refresh_discovery_paths: list[str] | None = None,
+        refresh_discovery_url_keys: list[str] | None = None,
+        refresh_discovery_token_keys: list[str] | None = None,
         probe_limit: int = 10,
         cache_ttl: float = 2.0,
         error_cache_ttl: float = 1.0,
@@ -161,8 +165,30 @@ class APIFuse(fuse.Operations):
             auth_token_file=refresh_token_file,
             auth_token_env=refresh_token_env,
         )
+        self._refresh_url_configured = self.refresh_url is not None
+        self._refresh_token_configured = self.refresh_token is not None
         self.refresh_body_token_key = refresh_body_token_key
         self.refresh_response_token_key = refresh_response_token_key
+        self.discover_refresh_from_response = discover_refresh_from_response
+        self.refresh_discovery_paths = self._normalize_discovery_paths(refresh_discovery_paths or [])
+        self.refresh_discovery_url_keys = tuple(
+            key.strip()
+            for key in (
+                refresh_discovery_url_keys
+                if refresh_discovery_url_keys
+                else ["refresh_url", "refresh_endpoint", "token_refresh_url"]
+            )
+            if key and key.strip()
+        )
+        self.refresh_discovery_token_keys = tuple(
+            key.strip()
+            for key in (
+                refresh_discovery_token_keys
+                if refresh_discovery_token_keys
+                else ["refresh_token"]
+            )
+            if key and key.strip()
+        )
         self._last_auth_error: str | None = None
         self._auth = self._build_auth_provider(
             header_name=auth_header,
@@ -934,6 +960,7 @@ class APIFuse(fuse.Operations):
             self._cache_json_error(cache_key, error)
             raise error from exc
 
+        self._discover_refresh_material(api_path, data)
         self._cache_json_success(cache_key, data)
         return data
 
@@ -959,20 +986,91 @@ class APIFuse(fuse.Operations):
         return None
 
     def _build_auth_provider(self, header_name: str, scheme: str):
-        if self.refresh_url and self.refresh_token is not None:
+        if (
+            self.auth_token
+            or self.refresh_url is not None
+            or self.refresh_token is not None
+            or self.discover_refresh_from_response
+        ):
             return RefreshingTokenAuth(
                 token=self.auth_token or "",
                 header_name=header_name,
                 scheme=scheme,
                 refresh_callback=self._refresh_access_token,
             )
-        if self.auth_token:
-            return StaticTokenAuth(
-                token=self.auth_token,
-                header_name=header_name,
-                scheme=scheme,
-            )
         return NoAuth()
+
+    def _normalize_discovery_paths(self, paths: list[str]) -> tuple[str, ...]:
+        normalized: list[str] = []
+        for raw in paths:
+            path = raw.strip()
+            if not path:
+                continue
+            if not path.startswith("/"):
+                path = f"/{path}"
+            path = path.rstrip("/") or "/"
+            if path not in normalized:
+                normalized.append(path)
+        return tuple(normalized)
+
+    def _is_refresh_discovery_path_allowed(self, api_path: str) -> bool:
+        if not self.discover_refresh_from_response:
+            return False
+        normalized = self._normalize_path(api_path)
+        if self.refresh_discovery_paths:
+            for prefix in self.refresh_discovery_paths:
+                if normalized == prefix or normalized.startswith(f"{prefix}/"):
+                    return True
+            return False
+
+        # Safe default scope: only auth-like routes when no explicit allowlist is set.
+        parts = [part.lower() for part in self._split_path(normalized)]
+        if not parts:
+            return False
+        return any(part in {"auth", "oauth", "token", "login", "session", "refresh"} for part in parts)
+
+    def _extract_string_by_key_candidates(
+        self,
+        payload: Any,
+        keys: tuple[str, ...],
+    ) -> str | None:
+        if not isinstance(payload, dict):
+            return None
+        containers: list[dict[str, Any]] = [payload]
+        data_node = payload.get("data")
+        if isinstance(data_node, dict):
+            containers.append(data_node)
+        for container in containers:
+            for key in keys:
+                value = container.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return None
+
+    def _discover_refresh_material(self, api_path: str, payload: Any) -> None:
+        if not self._is_refresh_discovery_path_allowed(api_path):
+            return
+
+        discovered_url = self._extract_string_by_key_candidates(payload, self.refresh_discovery_url_keys)
+        if discovered_url and not self._refresh_url_configured and self.refresh_url is None:
+            parsed = urllib.parse.urlparse(discovered_url)
+            if parsed.scheme in {"http", "https"} and parsed.netloc:
+                self.refresh_url = discovered_url.rstrip("/")
+            elif discovered_url.startswith("/"):
+                self.refresh_url = urllib.parse.urljoin(
+                    f"{self.base_url.rstrip('/')}/",
+                    discovered_url.lstrip("/"),
+                ).rstrip("/")
+            if self.refresh_url:
+                LOGGER.info("discovered refresh_url from %s", api_path)
+
+        discovered_token = self._extract_string_by_key_candidates(
+            payload,
+            self.refresh_discovery_token_keys,
+        )
+        if discovered_token and not self._refresh_token_configured and self.refresh_token is None:
+            self.refresh_token = discovered_token
+            LOGGER.info("discovered refresh token from %s", api_path)
 
     def _build_symlink_field_map(
         self,

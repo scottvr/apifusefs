@@ -109,6 +109,15 @@ Optional refresh-on-401 support:
 - `--refresh-body-token-key` (default: `refresh_token`)
 - `--refresh-response-token-key` (default: `access_token`)
 
+Optional refresh discovery from API responses (disabled by default):
+
+- `--discover-refresh-from-response`
+- `--refresh-discovery-path <prefix>` (repeatable allowlist; when omitted, only auth-like paths are considered)
+- `--refresh-discovery-url-key <json_key>` (repeatable; defaults: `refresh_url`, `refresh_endpoint`, `token_refresh_url`)
+- `--refresh-discovery-token-key <json_key>` (repeatable; default: `refresh_token`)
+
+Precedence rule: explicit CLI/env/file refresh values win; discovered values only fill missing `refresh_url`/`refresh_token`.
+
 ## Symlink Aliases
 
 `apifuse` can expose collection-level aliases that point at the canonical resource id entry.

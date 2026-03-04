@@ -37,16 +37,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--auth-token",
-        help="bearer token value to send as Authorization: Bearer <token>",
+        help="auth token value to send in the configured auth header",
     )
     parser.add_argument(
         "--auth-token-file",
-        help="read the bearer token from a local file",
+        help="read the auth token from a local file",
     )
     parser.add_argument(
         "--auth-token-env",
         default="APIFUSE_auth_token",
-        help="environment variable name to read the bearer token from (default: APIFUSE_auth_token)",
+        help="environment variable name to read the auth token from (default: APIFUSE_auth_token)",
     )
     parser.add_argument(
         "--auth-header",
@@ -84,6 +84,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--refresh-response-token-key",
         default="access_token",
         help="JSON key to read new access token from refresh response (default: access_token)",
+    )
+    parser.add_argument(
+        "--discover-refresh-from-response",
+        action="store_true",
+        help="opt-in: discover refresh URL/token from JSON responses on allowlisted paths",
+    )
+    parser.add_argument(
+        "--refresh-discovery-path",
+        action="append",
+        default=[],
+        help="path prefix allowlist for refresh discovery (repeatable), e.g. /auth or /session/login",
+    )
+    parser.add_argument(
+        "--refresh-discovery-url-key",
+        action="append",
+        default=[],
+        help="JSON key candidate for refresh URL discovery (repeatable)",
+    )
+    parser.add_argument(
+        "--refresh-discovery-token-key",
+        action="append",
+        default=[],
+        help="JSON key candidate for refresh token discovery (repeatable)",
     )
     parser.add_argument(
         "--probe-limit",
@@ -211,6 +234,10 @@ def main(argv: list[str] | None = None) -> int:
                 refresh_token_env=args.refresh_token_env,
                 refresh_body_token_key=args.refresh_body_token_key,
                 refresh_response_token_key=args.refresh_response_token_key,
+                discover_refresh_from_response=args.discover_refresh_from_response,
+                refresh_discovery_paths=args.refresh_discovery_path,
+                refresh_discovery_url_keys=args.refresh_discovery_url_key,
+                refresh_discovery_token_keys=args.refresh_discovery_token_key,
                 probe_limit=args.probe_limit,
                 cache_ttl=args.cache_ttl,
                 error_cache_ttl=args.error_cache_ttl,
