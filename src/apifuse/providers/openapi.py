@@ -18,6 +18,7 @@ from typing import Any
 
 import mfusepy as fuse
 
+from apifuse.auth import NoAuth, RefreshingTokenAuth, StaticTokenAuth
 from apifuse.fuse_ops import ProviderError, ProviderNode
 
 try:
@@ -131,6 +132,14 @@ class APIFuse(fuse.Operations):
         auth_token: str | None = None,
         auth_token_file: str | None = None,
         auth_token_env: str | None = "APIFUSE_auth_token",
+        auth_header: str = "Authorization",
+        auth_scheme: str = "Bearer",
+        refresh_url: str | None = None,
+        refresh_token: str | None = None,
+        refresh_token_file: str | None = None,
+        refresh_token_env: str | None = "APIFUSE_refresh_token",
+        refresh_body_token_key: str = "refresh_token",
+        refresh_response_token_key: str = "access_token",
         probe_limit: int = 10,
         cache_ttl: float = 2.0,
         error_cache_ttl: float = 1.0,
@@ -145,6 +154,19 @@ class APIFuse(fuse.Operations):
             auth_token=auth_token,
             auth_token_file=auth_token_file,
             auth_token_env=auth_token_env,
+        )
+        self.refresh_url = refresh_url.rstrip("/") if refresh_url else None
+        self.refresh_token = self._resolve_auth_token(
+            auth_token=refresh_token,
+            auth_token_file=refresh_token_file,
+            auth_token_env=refresh_token_env,
+        )
+        self.refresh_body_token_key = refresh_body_token_key
+        self.refresh_response_token_key = refresh_response_token_key
+        self._last_auth_error: str | None = None
+        self._auth = self._build_auth_provider(
+            header_name=auth_header,
+            scheme=auth_scheme,
         )
         self.probe_limit = max(0, probe_limit)
         self.cache_ttl = max(0.0, cache_ttl)
@@ -166,6 +188,55 @@ class APIFuse(fuse.Operations):
         self._dir_mode = stat.S_IFDIR | 0o755
         self._file_mode = stat.S_IFREG | 0o444
         self._symlink_mode = stat.S_IFLNK | 0o777
+
+    def bootstrap_validate(self, force: bool = False, sample_limit: int = 20) -> None:
+        candidates = self._bootstrap_probe_paths(sample_limit=sample_limit)
+        if not candidates:
+            message = "bootstrap probe found no GET endpoints to test"
+            if force:
+                LOGGER.warning("%s; continuing because --force is enabled", message)
+                return
+            raise APISpecError(message)
+
+        failures: list[str] = []
+        successes = 0
+        for api_path in candidates:
+            try:
+                self._fetch_json_path(api_path)
+                successes += 1
+                # One confirmed reachable endpoint is enough for default mount policy.
+                break
+            except APISpecError as exc:
+                failures.append(f"{api_path}: {exc}")
+
+        if successes > 0:
+            if failures:
+                LOGGER.warning(
+                    "bootstrap validation found partial reachability (%d failed probes before first success): %s",
+                    len(failures),
+                    "; ".join(failures[:3]),
+                )
+            return
+
+        message = "bootstrap validation failed; no reachable endpoints found"
+        if failures:
+            message = f"{message}. sample failures: {'; '.join(failures[:3])}"
+        if force:
+            LOGGER.warning("%s; continuing because --force is enabled", message)
+            return
+        raise APISpecError(message)
+
+    def _bootstrap_probe_paths(self, sample_limit: int = 20) -> list[str]:
+        paths: list[str] = []
+        for endpoint in self.endpoints.values():
+            if endpoint.list_path:
+                paths.append(endpoint.list_path)
+            if endpoint.item_path and endpoint.item_parameter:
+                paths.append(endpoint.item_path.replace(f"{{{endpoint.item_parameter}}}", "0"))
+            if len(paths) >= sample_limit:
+                break
+        # Deduplicate while preserving order.
+        return list(dict.fromkeys(paths))[:sample_limit]
 
     def access(self, path: str, mode: int) -> int:
         try:
@@ -396,6 +467,8 @@ class APIFuse(fuse.Operations):
         error = self._collection_error(endpoint)
         if error is None:
             return None
+        if self._last_auth_error:
+            error = f"{error}\nlast_auth_error: {self._last_auth_error}"
         return FileNode(content=f"{error}\n".encode("utf-8"))
 
     def _collection_error(self, endpoint: EndpointDefinition) -> str | None:
@@ -877,13 +950,29 @@ class APIFuse(fuse.Operations):
                 with open(auth_token_file, "r", encoding="utf-8") as handle:
                     value = handle.read().strip()
             except OSError as exc:
-                raise APISpecError(f"unable to read bearer token file {auth_token_file}: {exc}") from exc
+                raise APISpecError(f"unable to read auth token file {auth_token_file}: {exc}") from exc
             return value or None
         if auth_token_env:
             value = os.environ.get(auth_token_env, "").strip()
             if value:
                 return value
         return None
+
+    def _build_auth_provider(self, header_name: str, scheme: str):
+        if self.refresh_url and self.refresh_token is not None:
+            return RefreshingTokenAuth(
+                token=self.auth_token or "",
+                header_name=header_name,
+                scheme=scheme,
+                refresh_callback=self._refresh_access_token,
+            )
+        if self.auth_token:
+            return StaticTokenAuth(
+                token=self.auth_token,
+                header_name=header_name,
+                scheme=scheme,
+            )
+        return NoAuth()
 
     def _build_symlink_field_map(
         self,
@@ -1006,25 +1095,110 @@ class APIFuse(fuse.Operations):
             "Accept": accept,
             "User-Agent": "apifuse/0.1",
         }
-        if self.auth_token:
-            headers["Authorization"] = f"Bearer {self.auth_token}"
+        self._auth.apply(headers)
 
-        request = urllib.request.Request(url, headers=headers, method="GET")
-        try:
+        def _execute(request_headers: dict[str, str]) -> bytes:
+            request = urllib.request.Request(url, headers=request_headers, method="GET")
             with urllib.request.urlopen(
                 request,
                 timeout=self.timeout,
                 context=self._ssl_context,
             ) as response:
                 return response.read()
+
+        try:
+            payload = _execute(headers)
+            self._last_auth_error = None
+            return payload
         except urllib.error.HTTPError as exc:
             details = exc.read().decode("utf-8", errors="replace").strip()
+            if exc.code == 401 and self._auth.on_unauthorized():
+                refreshed_headers = {
+                    "Accept": accept,
+                    "User-Agent": "apifuse/0.1",
+                }
+                self._auth.apply(refreshed_headers)
+                try:
+                    payload = _execute(refreshed_headers)
+                    self._last_auth_error = None
+                    return payload
+                except urllib.error.HTTPError as retry_exc:
+                    retry_details = retry_exc.read().decode("utf-8", errors="replace").strip()
+                    retry_message = f"HTTP {retry_exc.code}"
+                    if retry_details:
+                        retry_message = f"{retry_message}: {retry_details[:200]}"
+                    self._last_auth_error = f"auth retry failed: {retry_message}"
+                    raise APISpecError(retry_message, status_code=retry_exc.code) from retry_exc
+                except urllib.error.URLError as retry_exc:
+                    self._last_auth_error = f"auth retry failed: {retry_exc.reason}"
+                    raise APISpecError(str(retry_exc.reason)) from retry_exc
             message = f"HTTP {exc.code}"
             if details:
                 message = f"{message}: {details[:200]}"
+            if exc.code in {401, 403}:
+                self._last_auth_error = message
             raise APISpecError(message, status_code=exc.code) from exc
         except urllib.error.URLError as exc:
             raise APISpecError(str(exc.reason)) from exc
+
+    def _refresh_access_token(self) -> str | None:
+        if not self.refresh_url or not self.refresh_token:
+            return None
+
+        refresh_payload = {self.refresh_body_token_key: self.refresh_token}
+        body = json.dumps(refresh_payload).encode("utf-8")
+        headers = {
+            "Accept": "application/json, application/*+json",
+            "Content-Type": "application/json",
+            "User-Agent": "apifuse/0.1",
+        }
+        request = urllib.request.Request(
+            self.refresh_url,
+            headers=headers,
+            data=body,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=self.timeout,
+                context=self._ssl_context,
+            ) as response:
+                payload = response.read()
+        except urllib.error.HTTPError as exc:
+            details = exc.read().decode("utf-8", errors="replace").strip()
+            self._last_auth_error = f"token refresh failed: HTTP {exc.code}: {details[:200]}"
+            LOGGER.warning(self._last_auth_error)
+            return None
+        except urllib.error.URLError as exc:
+            self._last_auth_error = f"token refresh failed: {exc.reason}"
+            LOGGER.warning(self._last_auth_error)
+            return None
+
+        try:
+            data = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._last_auth_error = "token refresh failed: response was not JSON"
+            LOGGER.warning(self._last_auth_error)
+            return None
+
+        if not isinstance(data, dict):
+            self._last_auth_error = "token refresh failed: response JSON was not an object"
+            LOGGER.warning(self._last_auth_error)
+            return None
+
+        token = data.get(self.refresh_response_token_key)
+        if not isinstance(token, str) or not token.strip():
+            self._last_auth_error = (
+                f"token refresh failed: missing non-empty '{self.refresh_response_token_key}' in response"
+            )
+            LOGGER.warning(self._last_auth_error)
+            return None
+
+        self.auth_token = token.strip()
+        self._last_auth_error = None
+        LOGGER.info("refreshed access token successfully")
+        return self.auth_token
 
     def _extract_get_response_schema(self, get_op: dict[str, Any]) -> dict[str, Any] | None:
         responses = get_op.get("responses")

@@ -89,13 +89,25 @@ cat /tmp/mnt_apifuse_json/0/name
 
 ## Authentication
 
-Bearer auth can be supplied in three ways:
+Auth tokens can be supplied in three ways:
 
 - `--auth-token <token>`
 - `--auth-token-file <path>`
 - `--auth-token-env <ENV_NAME>` (defaults to `APIFUSE_auth_token`)
 
-The token value should be the raw bearer token string. `apifuse` adds the `Authorization: Bearer ...` header itself.
+The token value should be the raw token string. By default, `apifuse` sends it as `Authorization: Bearer <token>`.
+
+Header formatting is configurable:
+
+- `--auth-header` (default: `Authorization`)
+- `--auth-scheme` (default: `Bearer`)
+
+Optional refresh-on-401 support:
+
+- `--refresh-url`
+- `--refresh-token` / `--refresh-token-file` / `--refresh-token-env`
+- `--refresh-body-token-key` (default: `refresh_token`)
+- `--refresh-response-token-key` (default: `access_token`)
 
 ## Symlink Aliases
 
@@ -154,6 +166,13 @@ Relevant flags:
 - `--error-cache-ttl`
 - `--cache-max-entries`
 - `--probe-limit`
+
+## Bootstrap Failure Policy
+
+In OpenAPI mode, apifuse performs a startup probe of sampled endpoints.
+
+- default: mount fails only if none of the sampled endpoints are reachable
+- `-f` / `--force`: mount anyway, even if bootstrap validation fails
 
 Example:
 

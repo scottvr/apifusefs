@@ -49,6 +49,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="environment variable name to read the bearer token from (default: APIFUSE_auth_token)",
     )
     parser.add_argument(
+        "--auth-header",
+        default="Authorization",
+        help="HTTP header name for the auth token (default: Authorization)",
+    )
+    parser.add_argument(
+        "--auth-scheme",
+        default="Bearer",
+        help="auth scheme/prefix used in the auth header value (default: Bearer)",
+    )
+    parser.add_argument(
+        "--refresh-url",
+        help="token refresh endpoint URL (enables refresh-on-401 when refresh token is provided)",
+    )
+    parser.add_argument(
+        "--refresh-token",
+        help="refresh token value",
+    )
+    parser.add_argument(
+        "--refresh-token-file",
+        help="read refresh token from a local file",
+    )
+    parser.add_argument(
+        "--refresh-token-env",
+        default="APIFUSE_refresh_token",
+        help="environment variable name to read refresh token from (default: APIFUSE_refresh_token)",
+    )
+    parser.add_argument(
+        "--refresh-body-token-key",
+        default="refresh_token",
+        help="JSON key used for refresh token in refresh request body (default: refresh_token)",
+    )
+    parser.add_argument(
+        "--refresh-response-token-key",
+        default="access_token",
+        help="JSON key to read new access token from refresh response (default: access_token)",
+    )
+    parser.add_argument(
         "--probe-limit",
         type=int,
         default=10,
@@ -95,6 +132,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="ask libfuse to daemonize internally (not recommended on macOS; prefer external process management)",
     )
     parser.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="force mount even if bootstrap validation fails",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="enable debug logging",
@@ -120,6 +163,8 @@ def main(argv: list[str] | None = None) -> int:
         args.json_input = os.path.abspath(args.json_input)
     if args.auth_token_file:
         args.auth_token_file = os.path.abspath(args.auth_token_file)
+    if args.refresh_token_file:
+        args.refresh_token_file = os.path.abspath(args.refresh_token_file)
     if args.log_file:
         args.log_file = os.path.abspath(args.log_file)
     args.foreground = not args.daemonize
@@ -158,6 +203,14 @@ def main(argv: list[str] | None = None) -> int:
                 auth_token=args.auth_token,
                 auth_token_file=args.auth_token_file,
                 auth_token_env=args.auth_token_env,
+                auth_header=args.auth_header,
+                auth_scheme=args.auth_scheme,
+                refresh_url=args.refresh_url,
+                refresh_token=args.refresh_token,
+                refresh_token_file=args.refresh_token_file,
+                refresh_token_env=args.refresh_token_env,
+                refresh_body_token_key=args.refresh_body_token_key,
+                refresh_response_token_key=args.refresh_response_token_key,
                 probe_limit=args.probe_limit,
                 cache_ttl=args.cache_ttl,
                 error_cache_ttl=args.error_cache_ttl,
@@ -165,6 +218,7 @@ def main(argv: list[str] | None = None) -> int:
                 symlink_names=args.symlink_names,
                 symlink_map=args.symlink_map,
             )
+            provider.bootstrap_validate(force=args.force)
             operations = ProviderFuse(OpenAPIProviderAdapter(provider))
         except APISpecError as exc:
             parser.error(str(exc))
