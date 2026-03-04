@@ -43,6 +43,15 @@ class EndpointDefinition:
     description: str | None
     operation_id: str | None
     responses: dict[str, Any]
+    list_schema: dict[str, Any] | None
+    item_schema: dict[str, Any] | None
+
+
+@dataclass
+class JSONCacheEntry:
+    expires_at: float
+    payload: Any | None = None
+    error: APISpecError | None = None
 
 
 class APISpecError(RuntimeError):
@@ -72,6 +81,9 @@ class APIFuse(fuse.Operations):
         bearer_token_file: str | None = None,
         bearer_token_env: str | None = "APIFUSE_BEARER_TOKEN",
         probe_limit: int = 10,
+        cache_ttl: float = 2.0,
+        error_cache_ttl: float = 1.0,
+        cache_max_entries: int = 512,
     ) -> None:
         self.timeout = timeout
         self.spec_source = api_spec
@@ -82,8 +94,13 @@ class APIFuse(fuse.Operations):
             bearer_token_env=bearer_token_env,
         )
         self.probe_limit = max(0, probe_limit)
+        self.cache_ttl = max(0.0, cache_ttl)
+        self.error_cache_ttl = max(0.0, error_cache_ttl)
+        self.cache_max_entries = max(1, cache_max_entries)
+        self._json_cache: dict[str, JSONCacheEntry] = {}
         self._ssl_context = ssl.create_default_context()
         self.spec = self._load_spec(api_spec)
+        self._components = self._extract_components(self.spec)
         self.base_url = self._determine_base_url(api_spec, self.spec, self.server_url_override)
         self.endpoints = self._discover_endpoints(self.spec)
         self._dir_mode = stat.S_IFDIR | 0o755
@@ -227,6 +244,8 @@ class APIFuse(fuse.Operations):
             return "collection", endpoint, []
         if len(parts) == 2 and parts[1] in {".meta.json", ".error.txt"}:
             return "collection_file", endpoint, [parts[1]]
+        if self._should_ignore_collection_child(parts[1]):
+            return "ignored", endpoint, parts[1:]
         return "resource_dir", endpoint, parts[1:]
 
     def _is_directory(self, path: str) -> bool:
@@ -269,6 +288,8 @@ class APIFuse(fuse.Operations):
                 "description": endpoint.description,
                 "operationId": endpoint.operation_id,
                 "responses": endpoint.responses,
+                "list_schema": endpoint.list_schema,
+                "item_schema": endpoint.item_schema,
             },
             indent=2,
             sort_keys=True,
@@ -358,15 +379,21 @@ class APIFuse(fuse.Operations):
         if not remainder:
             return None, None
 
+        if len(remainder) == 2 and remainder[1] == ".raw.json":
+            response = self._fetch_resource_response(endpoint, remainder[0])
+            body = json.dumps(response, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+            return "file", body
+        if any(self._should_ignore_nested_child(part) for part in remainder[1:]):
+            return None, None
+        if not self._is_schema_path_allowed(endpoint, remainder):
+            return None, None
+
         resource_id = remainder[0]
         response = self._fetch_resource_response(endpoint, resource_id)
         resource_root = self._extract_resource_root(response)
 
         if len(remainder) == 1:
             return "dir", None
-        if len(remainder) == 2 and remainder[1] == ".raw.json":
-            body = json.dumps(response, indent=2, sort_keys=True).encode("utf-8") + b"\n"
-            return "file", body
 
         node = resource_root
         for part in remainder[1:]:
@@ -394,6 +421,10 @@ class APIFuse(fuse.Operations):
     ) -> list[str]:
         if not remainder:
             raise fuse.FuseOSError(errno.ENOENT)
+        if any(self._should_ignore_nested_child(part) for part in remainder[1:]):
+            raise fuse.FuseOSError(errno.ENOENT)
+        if not self._is_schema_path_allowed(endpoint, remainder):
+            raise fuse.FuseOSError(errno.ENOENT)
 
         resource_id = remainder[0]
         response = self._fetch_resource_response(endpoint, resource_id)
@@ -401,7 +432,7 @@ class APIFuse(fuse.Operations):
 
         if len(remainder) == 1:
             entries = [".raw.json"]
-            entries.extend(self._list_child_names(resource_root))
+            entries.extend(self._merge_child_names(resource_root, endpoint.item_schema))
             return entries
 
         node = resource_root
@@ -421,9 +452,11 @@ class APIFuse(fuse.Operations):
                 continue
             raise fuse.FuseOSError(errno.ENOENT)
 
+        schema = self._resolve_schema_node_for_path(endpoint.item_schema, remainder[1:])
+
         if not isinstance(node, (dict, list)):
             raise fuse.FuseOSError(errno.ENOTDIR)
-        return self._list_child_names(node)
+        return self._merge_child_names(node, schema)
 
     def _list_child_names(self, node: Any) -> list[str]:
         if isinstance(node, dict):
@@ -431,6 +464,93 @@ class APIFuse(fuse.Operations):
         if isinstance(node, list):
             return [str(index) for index in range(len(node))]
         return []
+
+    def _merge_child_names(self, node: Any, schema: dict[str, Any] | None) -> list[str]:
+        names = set(self._list_child_names(node))
+        names.update(self._schema_child_names(schema))
+        return sorted(names, key=self._sort_key)
+
+    def _schema_child_names(self, schema: dict[str, Any] | None) -> list[str]:
+        resolved = self._resolve_schema(schema)
+        if not isinstance(resolved, dict):
+            return []
+        schema_type = resolved.get("type")
+        if schema_type == "object":
+            properties = resolved.get("properties")
+            if isinstance(properties, dict):
+                return [key for key in properties if isinstance(key, str)]
+        if schema_type == "array":
+            return []
+        return []
+
+    def _is_schema_path_allowed(
+        self,
+        endpoint: EndpointDefinition,
+        remainder: list[str],
+    ) -> bool:
+        if not remainder:
+            return True
+        if len(remainder) == 1:
+            return True
+        if len(remainder) == 2 and remainder[1] == ".raw.json":
+            return True
+        if endpoint.item_schema is None:
+            return True
+        return self._resolve_schema_node_for_path(endpoint.item_schema, remainder[1:]) is not None
+
+    def _resolve_schema_node_for_path(
+        self,
+        schema: dict[str, Any] | None,
+        parts: list[str],
+    ) -> dict[str, Any] | None:
+        current = self._resolve_schema(schema)
+        if current is None:
+            return None
+        if not parts:
+            return current
+
+        for part in parts:
+            current = self._resolve_schema(current)
+            if current is None:
+                return None
+
+            schema_type = current.get("type")
+            if schema_type == "object":
+                properties = current.get("properties")
+                if not isinstance(properties, dict):
+                    additional = current.get("additionalProperties")
+                    if additional is True:
+                        current = None
+                        continue
+                    if isinstance(additional, dict):
+                        current = additional
+                        continue
+                    return None
+                child = properties.get(part)
+                if not isinstance(child, dict):
+                    additional = current.get("additionalProperties")
+                    if additional is True:
+                        current = None
+                        continue
+                    if isinstance(additional, dict):
+                        current = additional
+                        continue
+                    return None
+                current = child
+                continue
+
+            if schema_type == "array":
+                if not part.isdigit():
+                    return None
+                items = current.get("items")
+                if not isinstance(items, dict):
+                    return None
+                current = items
+                continue
+
+            return None
+
+        return self._resolve_schema(current)
 
     def _fetch_resource_response(self, endpoint: EndpointDefinition, resource_id: str) -> Any:
         if endpoint.item_path is None or endpoint.item_parameter is None:
@@ -490,13 +610,26 @@ class APIFuse(fuse.Operations):
         return "".join(allowed).strip("._")[:200] or "item"
 
     def _fetch_json_path(self, api_path: str) -> Any:
+        cache_key = self._normalize_api_cache_key(api_path)
+        cached = self._get_cached_json(cache_key)
+        if cached is not None:
+            return cached
+
         url = urllib.parse.urljoin(f"{self.base_url.rstrip('/')}/", api_path.lstrip("/"))
         LOGGER.debug("GET %s", url)
-        payload = self._request_bytes(url, accept="application/json, application/*+json")
         try:
-            return json.loads(payload.decode("utf-8"))
+            payload = self._request_bytes(url, accept="application/json, application/*+json")
+            data = json.loads(payload.decode("utf-8"))
+        except APISpecError as exc:
+            self._cache_json_error(cache_key, exc)
+            raise
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise APISpecError(f"{url} did not return JSON") from exc
+            error = APISpecError(f"{url} did not return JSON")
+            self._cache_json_error(cache_key, error)
+            raise error from exc
+
+        self._cache_json_success(cache_key, data)
+        return data
 
     def _resolve_bearer_token(
         self,
@@ -549,6 +682,12 @@ class APIFuse(fuse.Operations):
             raise APISpecError("unable to load OpenAPI spec")
         raise APISpecError(str(last_error))
 
+    def _extract_components(self, spec: dict[str, Any]) -> dict[str, Any]:
+        components = spec.get("components")
+        if isinstance(components, dict):
+            return components
+        return {}
+
     def _parse_spec_text(self, raw: str) -> Any:
         try:
             return json.loads(raw)
@@ -599,6 +738,130 @@ class APIFuse(fuse.Operations):
             raise APISpecError(message, status_code=exc.code) from exc
         except urllib.error.URLError as exc:
             raise APISpecError(str(exc.reason)) from exc
+
+    def _extract_get_response_schema(self, get_op: dict[str, Any]) -> dict[str, Any] | None:
+        responses = get_op.get("responses")
+        if not isinstance(responses, dict):
+            return None
+
+        preferred_codes = ("200", "201", "202", "203", "204", "default")
+        response_obj: dict[str, Any] | None = None
+        for code in preferred_codes:
+            candidate = responses.get(code)
+            if isinstance(candidate, dict):
+                response_obj = candidate
+                break
+        if response_obj is None:
+            for candidate in responses.values():
+                if isinstance(candidate, dict):
+                    response_obj = candidate
+                    break
+        if response_obj is None:
+            return None
+
+        content = response_obj.get("content")
+        if not isinstance(content, dict):
+            return None
+        for media_type, media_obj in content.items():
+            if not isinstance(media_type, str) or not isinstance(media_obj, dict):
+                continue
+            if "json" not in media_type:
+                continue
+            schema = media_obj.get("schema")
+            if isinstance(schema, dict):
+                return schema
+        for media_obj in content.values():
+            if not isinstance(media_obj, dict):
+                continue
+            schema = media_obj.get("schema")
+            if isinstance(schema, dict):
+                return schema
+        return None
+
+    def _extract_resource_schema(self, response_schema: dict[str, Any] | None) -> dict[str, Any] | None:
+        resolved = self._resolve_schema(response_schema)
+        if not isinstance(resolved, dict):
+            return None
+        if resolved.get("type") == "array":
+            items = resolved.get("items")
+            if isinstance(items, dict):
+                return items
+        if resolved.get("type") == "object":
+            properties = resolved.get("properties")
+            if isinstance(properties, dict):
+                data_schema = properties.get("data")
+                if isinstance(data_schema, dict):
+                    data_resolved = self._resolve_schema(data_schema)
+                    if isinstance(data_resolved, dict):
+                        return data_resolved
+        return resolved
+
+    def _resolve_schema(
+        self,
+        schema: dict[str, Any] | None,
+        seen_refs: set[str] | None = None,
+    ) -> dict[str, Any] | None:
+        if not isinstance(schema, dict):
+            return None
+
+        current = schema
+        refs_seen = set() if seen_refs is None else set(seen_refs)
+        while isinstance(current, dict) and "$ref" in current:
+            ref = current.get("$ref")
+            if not isinstance(ref, str):
+                return current
+            if ref in refs_seen:
+                return current
+            refs_seen.add(ref)
+            resolved = self._resolve_ref(ref)
+            if not isinstance(resolved, dict):
+                return current
+            merged = dict(resolved)
+            for key, value in current.items():
+                if key != "$ref":
+                    merged[key] = value
+            current = merged
+
+        if isinstance(current, dict) and "allOf" in current:
+            all_of = current.get("allOf")
+            if isinstance(all_of, list):
+                merged: dict[str, Any] = {}
+                properties: dict[str, Any] = {}
+                required: list[str] = []
+                for part in all_of:
+                    part_schema = self._resolve_schema(part, refs_seen)
+                    if not isinstance(part_schema, dict):
+                        continue
+                    for key, value in part_schema.items():
+                        if key == "properties" and isinstance(value, dict):
+                            properties.update(value)
+                            continue
+                        if key == "required" and isinstance(value, list):
+                            required.extend(v for v in value if isinstance(v, str))
+                            continue
+                        merged[key] = value
+                if properties:
+                    merged["properties"] = properties
+                    merged.setdefault("type", "object")
+                if required:
+                    merged["required"] = list(dict.fromkeys(required))
+                for key, value in current.items():
+                    if key != "allOf":
+                        merged[key] = value
+                current = merged
+
+        return current
+
+    def _resolve_ref(self, ref: str) -> Any:
+        if not ref.startswith("#/"):
+            return None
+        node: Any = self.spec
+        for part in ref[2:].split("/"):
+            token = part.replace("~1", "/").replace("~0", "~")
+            if not isinstance(node, dict):
+                return None
+            node = node.get(token)
+        return node
 
     def _determine_base_url(
         self,
@@ -661,6 +924,8 @@ class APIFuse(fuse.Operations):
                     description=None,
                     operation_id=None,
                     responses={},
+                    list_schema=None,
+                    item_schema=None,
                 )
 
             list_path = existing.list_path
@@ -673,6 +938,14 @@ class APIFuse(fuse.Operations):
                 item_path = normalized
                 item_name = item_parameter
 
+            list_schema = existing.list_schema
+            item_schema = existing.item_schema
+            response_schema = self._extract_get_response_schema(get_op)
+            if item_parameter is None:
+                list_schema = response_schema
+            else:
+                item_schema = self._extract_resource_schema(response_schema)
+
             endpoints[name] = EndpointDefinition(
                 name=name,
                 base_path=base_path,
@@ -683,6 +956,8 @@ class APIFuse(fuse.Operations):
                 description=get_op.get("description") or existing.description,
                 operation_id=get_op.get("operationId") or existing.operation_id,
                 responses=get_op.get("responses", existing.responses),
+                list_schema=list_schema,
+                item_schema=item_schema,
             )
 
         if not endpoints:
@@ -722,6 +997,59 @@ class APIFuse(fuse.Operations):
             return fuse.FuseOSError(exc.errno)
         return fuse.FuseOSError(errno.EIO)
 
+    def _should_ignore_collection_child(self, name: str) -> bool:
+        return name.startswith(".") and name not in {".meta.json", ".error.txt"}
+
+    def _should_ignore_nested_child(self, name: str) -> bool:
+        return name.startswith(".") and name != ".raw.json"
+
+    def _normalize_api_cache_key(self, api_path: str) -> str:
+        normalized = self._normalize_path(api_path)
+        if api_path.endswith("/") and normalized != "/":
+            return f"{normalized}/"
+        return normalized
+
+    def _get_cached_json(self, cache_key: str) -> Any | None:
+        entry = self._json_cache.get(cache_key)
+        if entry is None:
+            return None
+        now = time.time()
+        if entry.expires_at <= now:
+            self._json_cache.pop(cache_key, None)
+            return None
+        self._json_cache.pop(cache_key, None)
+        self._json_cache[cache_key] = entry
+        if entry.error is not None:
+            raise APISpecError(str(entry.error), status_code=entry.error.status_code)
+        return entry.payload
+
+    def _cache_json_success(self, cache_key: str, payload: Any) -> None:
+        if self.cache_ttl <= 0:
+            self._json_cache.pop(cache_key, None)
+            return
+        self._json_cache.pop(cache_key, None)
+        self._json_cache[cache_key] = JSONCacheEntry(
+            expires_at=time.time() + self.cache_ttl,
+            payload=payload,
+        )
+        self._trim_cache()
+
+    def _cache_json_error(self, cache_key: str, error: APISpecError) -> None:
+        if self.error_cache_ttl <= 0:
+            self._json_cache.pop(cache_key, None)
+            return
+        self._json_cache.pop(cache_key, None)
+        self._json_cache[cache_key] = JSONCacheEntry(
+            expires_at=time.time() + self.error_cache_ttl,
+            error=APISpecError(str(error), status_code=error.status_code),
+        )
+        self._trim_cache()
+
+    def _trim_cache(self) -> None:
+        while len(self._json_cache) > self.cache_max_entries:
+            oldest_key = next(iter(self._json_cache))
+            self._json_cache.pop(oldest_key, None)
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -755,6 +1083,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=10,
         help="when collection GET fails, probe ids 0..N-1 via the item endpoint",
+    )
+    parser.add_argument(
+        "--cache-ttl",
+        type=float,
+        default=2.0,
+        help="seconds to cache successful JSON responses (default: 2.0)",
+    )
+    parser.add_argument(
+        "--error-cache-ttl",
+        type=float,
+        default=1.0,
+        help="seconds to cache failed JSON responses (default: 1.0)",
+    )
+    parser.add_argument(
+        "--cache-max-entries",
+        type=int,
+        default=512,
+        help="maximum number of cached JSON responses (default: 512)",
     )
     parser.add_argument(
         "--timeout",
@@ -793,6 +1139,9 @@ def main(argv: list[str] | None = None) -> int:
             bearer_token_file=args.bearer_token_file,
             bearer_token_env=args.bearer_token_env,
             probe_limit=args.probe_limit,
+            cache_ttl=args.cache_ttl,
+            error_cache_ttl=args.error_cache_ttl,
+            cache_max_entries=args.cache_max_entries,
         )
     except APISpecError as exc:
         parser.error(str(exc))

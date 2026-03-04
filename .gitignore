@@ -1,6 +1,8 @@
+mnt/
 .DS_Store
 coverage.md
 .vscode/
+mnt/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
