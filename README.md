@@ -144,6 +144,8 @@ Add explicit alias mappings:
 
 The right-hand side is a path inside each resource object, not an API path.
 
+In `--mode json`, aliases are created at the root when the JSON document is a top-level list. For JSON mode mappings, use either `root=<field-path>` or just `<field-path>`.
+
 ## Caching
 
 Short-lived caching is enabled to protect the local machine and the API from noisy filesystem clients.

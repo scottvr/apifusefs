@@ -1380,19 +1380,14 @@ def build_parser() -> argparse.ArgumentParser:
         description="Mount a read-only FUSE filesystem backed by an OpenAPI spec or static JSON."
     )
     parser.add_argument("mountpoint", help="directory where the filesystem will be mounted")
-    parser.add_argument(
-        "--mode",
-        choices=("openapi", "json"),
-        default="openapi",
-        help="data source mode (default: openapi)",
-    )
-    parser.add_argument(
+    source_group = parser.add_mutually_exclusive_group(required=True)
+    source_group.add_argument(
         "--api-spec",
-        help="path or URL for the OpenAPI JSON/YAML spec, or a base API URL (openapi mode)",
+        help="path or URL for the OpenAPI JSON/YAML spec, or a base API URL",
     )
-    parser.add_argument(
+    source_group.add_argument(
         "--json-input",
-        help="path to a local JSON file to mount directly (json mode)",
+        help="path to a local JSON file to mount directly",
     )
     parser.add_argument(
         "--server-url",
@@ -1539,7 +1534,11 @@ def main(argv: list[str] | None = None) -> int:
                 payload = json.load(handle)
         except (OSError, json.JSONDecodeError) as exc:
             parser.error(f"unable to load JSON from {args.json_input}: {exc}")
-        operations = JSONFuse(payload)
+        operations = JSONFuse(
+            payload,
+            symlink_names=args.symlink_names,
+            symlink_map=args.symlink_map,
+        )
 
     fuse.FUSE(
         operations,
