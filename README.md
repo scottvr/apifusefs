@@ -1,10 +1,10 @@
 # apifuse
 
 `apifuse` is a user-space FUSE proof of concept that projects an OpenAPI-described  
-REST API into a mounted read-only filesystem on Linux and MacOS (or on Windows, in WSL2.) 
+REST API into a mounted read-only filesystem on Linux and MacOS (or on Windows, in WSL2.)  
 The contents of the filesystem are dynamically populated with "files" and "directories"  
-created in real-time with data received from REST (HTTP) calls to an OpenAI-spec API. Obviously,
-that's gonna come at a cost of pretty high latency compared to an actual disk drive, but no one 
+created in real-time with data received from REST (HTTP) calls to an OpenAI-spec API. Obviously,  
+that's gonna come at a cost of pretty high latency compared to an actual disk drive, but no one   
 is going to mount an API as a filesystem in order to top any IOPS benchmarks.
 
 
