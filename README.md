@@ -30,30 +30,35 @@ It is currently read-only. `POST`, `PUT`, `PATCH`, and `DELETE` are not implemen
 - a working FUSE/macFUSE environment
 - `mfusepy`
 
-This repo already uses a local virtualenv in `.venv/`.
+## Suggested Installation
 
-## Install
-
-If you are using the existing local venv:
-
+- Create a new venv if needed 
+e.g.,
 ```bash
-./.venv/bin/python -m pip list | grep mfuse
+python -mvenv .venv
+```
+or using `uv`, `pipx`, etc.  if you prefer.
+
+- Install dependencies as needed, using your package manager of choice:
+```bash
+uv pip install -e .
 ```
 
-If you need to install dependencies:
+Since `apifuse` is not yet packaged for PyPi and you are running from 
+the cloned repo, the `-e` (editable) method is recommended.
 
-```bash
-uv pip install -r pyproject.toml
-```
+An entry-point to the cli will be installed into your venv's bin path such
+that it will then be available just by invoking `apifuse` from within your
+shell with the venv activated.  e.g., with (`source .venv/bin/activate` or `.\venv\Scripts\activate`)
 
 ## Basic Usage
 
-OpenAPI mode:
+**OpenAPI (HTTP/REST) mode:**
 
-Mount using a local OpenAPI file and an explicit server URL:
+Mount using a local OpenAPI/swagger json or yaml file and an explicit server URL:
 
 ```bash
-PYTHONPATH=src ./.venv/bin/python -m apifuse \
+apifuse \
   --api-spec ./openapi.json \
   --server-url http://127.0.0.1:8000 \
   --auth-token-file ./bearer.token \
@@ -66,16 +71,20 @@ Then inspect the mounted tree:
 ls /tmp/mnt_apifuse
 ls /tmp/mnt_apifuse/users
 ls /tmp/mnt_apifuse/users/3
-cat /tmp/mnt_apifuse/users/3/username
+cat /tmp/mnt_apifuse/users/3/groups
 ```
 
-JSON mode:
+**JSON (local file) mode:**
 
-Mount a local JSON file directly with no API calls:
+Mount a local JSON file directly with no API callsi.
+Here I am using the output of a call to the GitHub API
+endpoint `/user/repos`a:
+
 
 ```bash
-PYTHONPATH=src ./.venv/bin/python -m apifuse \
+apifuse \
   --json-input ./repos.json \
+  --symlink-names \
   /tmp/mnt_apifuse_json
 ```
 
@@ -83,9 +92,66 @@ Then inspect:
 
 ```bash
 ls /tmp/mnt_apifuse_json
-ls /tmp/mnt_apifuse_json/0
+ls /tmp/mnt_apifuse_json/0/
 cat /tmp/mnt_apifuse_json/0/name
 ```
+
+With the `--symlink-names` flag, the contents of that `name` file (field from the json)
+have already been read and applied as a symlink in the root directory of the mount so that
+you don't have to do such things as shown above in order to know which repo `0` refers to:
+
+
+```bash
+apifuse \
+  --json-input ./repos.json \
+  --symlink-names \
+  /tmp/mnt_apifuse_json
+```
+
+Then inspect:
+
+```bash
+$ ls /tmp/mnt_apifuse_json
+$ cat /tmp/mnt_apifuse_json/apifuse/name
+apifuse
+$ cat /tmp/mnt_apifuse_json/0/name
+apifuse
+$ readlink -f /tmp/mnt_apifuse_json/apifuse
+/tmp/mnt_apifuse_json/0
+$ readlink -f /tmp/mnt_apifuse_json/0
+/tmp/mnt_apifuse_json/0
+```
+
+## Symlinking values to Collection names
+
+Note: `--symlink-names` works exactly the same in `OpenAI` mode as what is shown above in
+the JSON example wrt to the filesystem; it just retrieves the data with an HTTP call as per
+the API spec.
+
+In addition to the symlinking using the values within common field names such as `name`,  `username`, `title`, `SLUG`, explicit alias mappings can be achieved with `--symlink-map`:  
+
+Add explicit alias mappings:
+
+```bash
+apifuse \
+  --api-spec ./openapi.json \
+  --server-url http://127.0.0.1:8000 \
+  --auth-token-file ./bearer.token \
+  --symlink-map users=username \
+  --symlink-map products=title \
+  --symlink-map products=categories/name \
+  /tmp/mnt_apifuse
+```
+
+`--symlink-map` syntax is:
+
+```text
+<collection>=<field-path>
+```
+
+The right-hand side is a path inside each resource object, not an API path.
+
+With `--json-input`, aliases are created at the root when the JSON document is a top-level list. For JSON-mode mappings, use either `root=<field-path>` or just `<field-path>`.
 
 ## Authentication
 
@@ -120,52 +186,6 @@ Optional refresh discovery from API responses (disabled by default):
 Precedence rule: explicit CLI/env/file refresh values win; discovered values only fill missing `refresh_url`/`refresh_token`.
 For `--auth-json-file`, JSON-derived values are only used when token/refresh values are not already provided by direct CLI, token-file, or configured token-env values.
 
-## Symlink Aliases
-
-`apifuse` can expose collection-level aliases that point at the canonical resource id entry.
-
-Example:
-
-```text
-products/
-  1/
-  2/
-  dollhouse -> 2
-```
-
-Enable common name-like aliases:
-
-```bash
-PYTHONPATH=src ./.venv/bin/python -m apifuse \
-  --api-spec ./openapi.json \
-  --server-url http://127.0.0.1:8000 \
-  --auth-token-file ./bearer.token \
-  --symlink-names \
-  /tmp/mnt_apifuse
-```
-
-Add explicit alias mappings:
-
-```bash
-PYTHONPATH=src ./.venv/bin/python -m apifuse \
-  --api-spec ./openapi.json \
-  --server-url http://127.0.0.1:8000 \
-  --auth-token-file ./bearer.token \
-  --symlink-map users=username \
-  --symlink-map products=title \
-  --symlink-map products=categories/name \
-  /tmp/mnt_apifuse
-```
-
-`--symlink-map` syntax is:
-
-```text
-<collection>=<field-path>
-```
-
-The right-hand side is a path inside each resource object, not an API path.
-
-With `--json-input`, aliases are created at the root when the JSON document is a top-level list. For JSON-mode mappings, use either `root=<field-path>` or just `<field-path>`.
 
 ## Caching
 
@@ -188,7 +208,7 @@ In OpenAPI mode, apifuse performs a startup probe of sampled endpoints.
 Example:
 
 ```bash
-PYTHONPATH=src ./.venv/bin/python -m apifuse \
+apifuse \
   --api-spec ./openapi.json \
   --server-url http://127.0.0.1:8000 \
   --auth-token-file ./bearer.token \
@@ -200,10 +220,10 @@ PYTHONPATH=src ./.venv/bin/python -m apifuse \
 
 ## Logging
 
-Enable debug logging:
+Enable debug logging with `--debug`
 
 ```bash
-PYTHONPATH=src ./.venv/bin/python -m apifuse \
+apifuse \
   --api-spec ./openapi.json \
   --server-url http://127.0.0.1:8000 \
   --auth-token-file ./bearer.token \
@@ -211,10 +231,10 @@ PYTHONPATH=src ./.venv/bin/python -m apifuse \
   /tmp/mnt_apifuse
 ```
 
-Write logs to a file:
+Write logs to a filei with `--log-file`:
 
 ```bash
-PYTHONPATH=src ./.venv/bin/python -m apifuse \
+apifuse \
   --api-spec ./openapi.json \
   --server-url http://127.0.0.1:8000 \
   --auth-token-file ./bearer.token \
@@ -225,12 +245,12 @@ PYTHONPATH=src ./.venv/bin/python -m apifuse \
 
 ## macOS Caveat
 
-Foreground mode is the default and is the recommended mode.
+Running `apifuse` in foreground mode is the default and is the recommended mode.
 
 On macOS, libfuse's internal daemon mode has been unreliable in testing. If you need background behavior, keep `apifuse` in foreground mode and background the process externally:
 
 ```bash
-nohup env PYTHONPATH=src ./.venv/bin/python -m apifuse \
+nohup env apifuse \
   --api-spec ./openapi.json \
   --server-url http://127.0.0.1:8000 \
   --auth-token-file ./bearer.token \
@@ -239,10 +259,10 @@ nohup env PYTHONPATH=src ./.venv/bin/python -m apifuse \
   >/tmp/apifuse.stdout 2>&1 &
 ```
 
-If you explicitly want libfuse daemon mode anyway, use:
+If you explicitly want `apifuse` to use `libfuse daemon mode` despite the warnings, use:
 
 ```bash
-PYTHONPATH=src ./.venv/bin/python -m apifuse \
+apifuse \
   --api-spec ./openapi.json \
   --server-url http://127.0.0.1:8000 \
   --auth-token-file ./bearer.token \
@@ -253,7 +273,7 @@ PYTHONPATH=src ./.venv/bin/python -m apifuse \
 
 ## Unmount
 
-On macOS:
+Ensure the `apifuse` process controlling this mount is stopped. Then run:
 
 ```bash
 umount /tmp/mnt_apifuse
@@ -269,7 +289,4 @@ umount -f /tmp/mnt_apifuse
 
 Planned follow-up work:
 
-- stricter schema/exploratory mode split
-- smarter alias caching and alias derivation from collection payloads
-- writable CRUD mappings for create/update/delete
-- quieter handling of common macOS metadata probes
+- writable CRUD mappings for create/update/delete (Smart mappings between filesystem operation intent and HTTP POST/PUT/PATCH/DELETE)
