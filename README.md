@@ -297,6 +297,4 @@ umount -f /tmp/mnt_apifuse
 
 ## Next Steps
 
-Planned follow-up work:
-
 - writable CRUD mappings for create/update/delete (Smart mappings between filesystem operation intent and HTTP POST/PUT/PATCH/DELETE)
