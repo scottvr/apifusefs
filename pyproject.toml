@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "apifuse"
 version = "0.1.0"
-description = "APIFUSE - filesystem mounted projection of HTTP/REST OpenAPI described (swagger/openapi[json|yaml] APIs or non-API JSON collections)
+description = "APIFUSE - filesystem mounted projection of HTTP/REST OpenAPI-described ([swagger|openapi].[json|yaml] APIs or non-API JSON collections)
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
