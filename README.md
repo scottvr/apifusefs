@@ -297,4 +297,5 @@ umount -f /tmp/mnt_apifuse
 
 ## Next Steps
 
+- More graceful (and earlier) handling (ignoring) of MacOS "shadow" file probes (._{filename}, .DS_Store, etc) since it is unlikely that any API or JSON data is really naming things like this
 - writable CRUD mappings for create/update/delete (Smart mappings between filesystem operation intent and HTTP POST/PUT/PATCH/DELETE)
